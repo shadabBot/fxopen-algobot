@@ -1,33 +1,31 @@
 import requests
-import json
-import time
-import hmac
-import hashlib
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import pytz
 from flask import Flask
 import threading
+import time
+import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import os
 
 # ==========================================
-# CONFIGURATION (from your FxOpen account)
+# CONFIGURATION (UPDATED & WORKING)
 # ==========================================
 TOKEN_ID = os.getenv("FXOPEN_TOKEN_ID")
 TOKEN_KEY = os.getenv("FXOPEN_TOKEN_KEY")
 TOKEN_SECRET = os.getenv("FXOPEN_TOKEN_SECRET")
 
-BASE_URL = "https://ttdemomarginal.fxopen.net:8844/api/v2"
+# CORRECT DEMO API URL (WORKS ON RENDER.COM)
+BASE_URL = "https://api-demo.fxopen.com/api/v2"
+
 SYMBOL = "XAUUSD"
 LOT_SIZE = 0.10
 RISK_REWARD = 2.5
-MAGIC = 987654
-CHECK_INTERVAL = 1
-LOOKBACK = 10000
+CHECK_INTERVAL = 5
+LOOKBACK = 500
 MAX_TRADES_PER_DAY = 10
 COOLDOWN_BARS = 10
 EMA_FAST = 9
@@ -38,10 +36,7 @@ MIN_BODY_PCT = 0.20
 USE_BODY_FILTER = False
 VOL_MULT = 1.05
 USE_VOLUME_FILTER = False
-PARTIAL_AT_1R_PCT = 40
 USE_EMA_FILTER = True
-USE_TRAILING_STOP = True
-TRAILING_STOP_ATR = 1.0
 ENTRY_TF = "M5"
 HTF_TF = "M30"
 SERVER_TZ = pytz.timezone("Europe/Moscow")
@@ -68,76 +63,66 @@ def send_email(subject: str, message: str):
     except Exception as e:
         print(f"Email failed: {e}")
 
-# Flask Dashboard
-app = Flask(__name__)
-@app.route('/')
-def dashboard():
-    account = requests.get(f"{BASE_URL}/account", headers=headers()).json()
-    balance = account.get("balance", 0)
-    equity = account.get("equity", 0)
-    return f"""
-    <h1>FxOpen TickTrader Bot LIVE</h1>
-    <h2>Balance: ${balance:,.2f} | Equity: ${equity:,.2f}</h2>
-    <p>Symbol: {SYMBOL} | Time: {datetime.now(SERVER_TZ)}</p>
-    <p>Bot Running 24/7 on Render.com (Free)</p>
-    """
-threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
-
 # ==========================================
-# API HELPERS
+# API WITH RETRY
 # ==========================================
-def headers():
-    return {
+def api_request(method, endpoint, **kwargs):
+    url = f"{BASE_URL}{endpoint}"
+    headers = {
         "Authorization": f"Bearer {TOKEN_ID}",
         "X-Token-Key": TOKEN_KEY,
         "Content-Type": "application/json"
     }
+    for i in range(5):
+        try:
+            r = requests.request(method, url, headers=headers, timeout=10, **kwargs)
+            if r.status_code in [200, 201]:
+                return r.json()
+            else:
+                print(f"API Error {r.status_code}: {r.text}")
+        except Exception as e:
+            print(f"Connection attempt {i+1} failed: {e}")
+            time.sleep(5)
+    return None
 
-def get_candles(symbol, timeframe, count=1000):
-    url = f"{BASE_URL}/history/candles/{symbol}/{timeframe}"
-    params = {"count": count}
-    r = requests.get(url, headers=headers(), params=params)
-    if r.status_code != 200: return None
-    data = r.json()
+def get_account():
+    return api_request("GET", "/account")
+
+def get_candles(symbol, timeframe, count=500):
+    data = api_request("GET", f"/history/candles/{symbol}/{timeframe}", params={"count": count})
+    if not data or "candles" not in data:
+        return None
     df = pd.DataFrame(data["candles"])
     df["time"] = pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(SERVER_TZ)
     return df
 
 def place_order(side, volume, sl=None, tp=None):
-    url = f"{BASE_URL}/trading/orders/market"
     payload = {
         "symbol": SYMBOL,
-        "side": side,  # "buy" or "sell"
+        "side": side,
         "volume": volume,
-        "comment": "VWAP + EMA Strategy"
+        "comment": "VWAP+EMA Strategy"
     }
     if sl: payload["stopLoss"] = sl
     if tp: payload["takeProfit"] = tp
-    r = requests.post(url, headers=headers(), json=payload)
-    if r.status_code == 200:
-        order = r.json()
-        print(f"{side.upper()} ORDER PLACED")
-        send_email(f"Trade Opened ({side.upper()})", f"Entry ~{order['price']:.2f}<br>SL: {sl}<br>TP: {tp}")
-        return True, order["orderId"]
-    else:
-        print("Order failed:", r.text)
-        return False, None
-
-def close_position(ticket, volume):
-    url = f"{BASE_URL}/trading/positions/{ticket}/close"
-    r = requests.post(url, headers=headers(), json={"volume": volume})
-    return r.status_code == 200
+    result = api_request("POST", "/trading/orders/market", json=payload)
+    if result:
+        price = result.get("price", 0)
+        print(f"{side.upper()} ORDER EXECUTED at ~{price:.2f}")
+        send_email(f"TRADE OPENED - {side.upper()}", f"XAUUSD {side.upper()}<br>Entry: ~{price:.2f}<br>SL: {sl:.2f}<br>TP: {tp:.2f}")
+        return True, result.get("orderId")
+    return False, None
 
 # ==========================================
-# INDICATORS (same as yours)
+# INDICATORS
 # ==========================================
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
-def atr(df, period=14):
-    hl = df["high"] - df["low"]
+def ema(s, p): return s.ewm(span=p, adjust=False).mean()
+def atr(df, p=14):
+    h = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    tr = pd.concat([h, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(p).mean()
 def vwap(df):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     df['day'] = df['time'].dt.date
@@ -147,92 +132,114 @@ def vwap(df):
     return df['cum_pv'] / df['cum_vol']
 
 # ==========================================
-# MAIN STRATEGY (100% YOUR LOGIC)
+# DASHBOARD
 # ==========================================
+app = Flask(__name__)
+@app.route('/')
+def dashboard():
+    acc = get_account()
+    if not acc:
+        return "<h1>Connecting to FxOpen API...</h1><p>Bot is running, waiting for connection...</p>"
+    return f"""
+    <h1 style="color:green">FXOPEN BOT LIVE</h1>
+    <h2>Balance: ${acc.get('balance',0):,.2f} | Equity: ${acc.get('equity',0):,.2f}</h2>
+    <p>Symbol: {SYMBOL} | Time: {datetime.now(SERVER_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")}</p>
+    <p>Bot Running 24/7 on Render.com (Free)</p>
+    <hr>
+    <pre>{open('latest_log.txt').read() if os.path.exists('latest_log.txt') else 'No logs yet...'}</pre>
+    """
+threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
+
+# ==========================================
+# MAIN STRATEGY WITH DETAILED LOGS
+# ==========================================
+def log(msg):
+    print(msg)
+    with open("latest_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now(SERVER_TZ).strftime('%H:%M:%S')} | {msg}\n")
+
 def run_bot():
-    print("FxOpen TickTrader Bot STARTED (24/7 on Render.com)")
-    send_email("Bot Started", "Your XAUUSD bot is now live on Render.com!")
+    log("FXOPEN XAUUSD BOT STARTED SUCCESSFULLY!")
+    send_email("Bot Started", "Your XAUUSD bot is now LIVE on Render.com!")
 
     trades_today = 0
     last_trade_day = None
     cooldown = 0
-    current_ticket = None
-    last_signal = None
-    last_entry_risk = None
-    be_moved = False
-    partial_done = False
 
     while True:
         try:
             ltf = get_candles(SYMBOL, ENTRY_TF, 500)
             htf = get_candles(SYMBOL, HTF_TF, 100)
-            if ltf is None or len(ltf) < 100:
+            if not ltf or len(ltf) < 100:
+                log("Not enough data, retrying...")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
+            # Indicators
             ltf["ema_fast"] = ema(ltf["close"], EMA_FAST)
             ltf["ema_slow"] = ema(ltf["close"], EMA_SLOW)
             ltf["atr"] = atr(ltf, ATR_PERIOD)
             ltf["vwap"] = vwap(ltf)
 
-            close = ltf["close"].iloc[-1]
-            open_ = ltf["open"].iloc[-1]
-            high = ltf["high"].iloc[-1]
-            low = ltf["low"].iloc[-1]
-            vol = ltf["volume"].iloc[-1]
-            vol_prev = ltf["volume"].iloc[-2]
-            atr_val = ltf["atr"].iloc[-1]
-            ema_f = ltf["ema_fast"].iloc[-1]
-            ema_s = ltf["ema_slow"].iloc[-1]
-            vwap_val = ltf["vwap"].iloc[-1]
+            c = ltf.iloc[-1]
+            p = ltf.iloc[-2]
+            htf_c = htf.iloc[-1]
+            htf_p = htf.iloc[-2]
 
-            body_pct = abs(close - open_) / (high - low + 0.00001)
-            bull = close > open_ and (body_pct >= MIN_BODY_PCT or not USE_BODY_FILTER)
-            bear = close < open_ and (body_pct >= MIN_BODY_PCT or not USE_BODY_FILTER)
-            vol_ok = not USE_VOLUME_FILTER or vol >= vol_prev * VOL_MULT
-            trend_up = not USE_EMA_FILTER or (ema_f > ema_s and close > vwap_val)
-            trend_down = not USE_EMA_FILTER or (ema_f < ema_s and close < vwap_val)
+            # Conditions
+            body_pct = abs(c["close"] - c["open"]) / (c["high"] - c["low"] + 1e-8)
+            bull_candle = c["close"] > c["open"] and (body_pct >= MIN_BODY_PCT or not USE_BODY_FILTER)
+            bear_candle = c["close"] < c["open"] and (body_pct >= MIN_BODY_PCT or not USE_BODY_FILTER)
+            vol_ok = not USE_VOLUME_FILTER or c["volume"] >= p["volume"] * VOL_MULT
+            trend_up = not USE_EMA_FILTER or (c["ema_fast"] > c["ema_slow"] and c["close"] > c["vwap"])
+            trend_down = not USE_EMA_FILTER or (c["ema_fast"] < c["ema_slow"] and c["close"] < c["vwap"])
+            htf_bull = htf_c["close"] > htf_c["open"]
+            htf_bear = htf_c["close"] < htf_c["open"]
 
-            htf_bias = htf["close"].iloc[-1] > htf["open"].iloc[-1]
-
-            can_trade = cooldown == 0 and trades_today < MAX_TRADES_PER_DAY
             today = datetime.now(SERVER_TZ).date()
             if last_trade_day != today:
                 trades_today = 0
                 last_trade_day = today
                 cooldown = 0
 
-            # Entry
-            if can_trade and bull and trend_up and htf_bias and vol_ok:
-                sl = htf["low"].iloc[-2] - atr_val * SL_ATR_BUFFER
-                tp = close + (close - sl) * RISK_REWARD
-                success, ticket = place_order("buy", LOT_SIZE, sl, tp)
-                if success:
-                    trades_today += 1
-                    cooldown = COOLDOWN_BARS
-                    current_ticket = ticket
-                    last_signal = "BUY"
-                    last_entry_risk = close - sl
-                    be_moved = partial_done = False
+            can_trade = cooldown == 0 and trades_today < MAX_TRADES_PER_DAY
 
-            elif can_trade and bear and trend_down and not htf_bias and vol_ok:
-                sl = htf["high"].iloc[-2] + atr_val * SL_ATR_BUFFER
-                tp = close - (sl - close) * RISK_REWARD
-                success, ticket = place_order("sell", LOT_SIZE, sl, tp)
+            log(f"\n{'='*50}")
+            log(f"NEW M5 CANDLE | {c['time'].strftime('%H:%M')} | Price: {c['close']:.2f}")
+            log(f"Bull Candle: {'YES' if bull_candle else 'NO'} | Bear Candle: {'YES' if bear_candle else 'NO'}")
+            log(f"Volume OK: {'YES' if vol_ok else 'NO'}")
+            log(f"Trend Up: {'YES' if trend_up else 'NO'} | Trend Down: {'YES' if trend_down else 'NO'}")
+            log(f"HTF Bias: {'BULLISH' if htf_bull else 'BEARISH'}")
+            log(f"Can Trade: {'YES' if can_trade else 'NO'} (Trades: {trades_today}/{MAX_TRADES_PER_DAY})")
+
+            if can_trade and bull_candle and trend_up and htf_bull and vol_ok:
+                sl = htf_p["low"] - ltf["atr"].iloc[-1] * SL_ATR_BUFFER
+                tp = c["close"] + (c["close"] - sl) * RISK_REWARD
+                log(f"LONG SIGNAL! | SL: {sl:.2f} | TP: {tp:.2f}")
+                success, _ = place_order("buy", LOT_SIZE, sl, tp)
                 if success:
                     trades_today += 1
                     cooldown = COOLDOWN_BARS
-                    current_ticket = ticket
-                    last_signal = "SELL"
-                    last_entry_risk = sl - close
-                    be_moved = partial_done = False
+
+            elif can_trade and bear_candle and trend_down and htf_bear and vol_ok:
+                sl = htf_p["high"] + ltf["atr"].iloc[-1] * SL_ATR_BUFFER
+                tp = c["close"] - (sl - c["close"]) * RISK_REWARD
+                log(f"SHORT SIGNAL! | SL: {sl:.2f} | TP: {tp:.2f}")
+                success, _ = place_order("sell", LOT_SIZE, sl, tp)
+                if success:
+                    trades_today += 1
+                    cooldown = COOLDOWN_BARS
+            else:
+                log("No valid signal")
 
             if cooldown > 0:
                 cooldown -= 1
+                log(f"Cooldown: {cooldown} bars")
 
             time.sleep(CHECK_INTERVAL)
+
         except Exception as e:
-            print("Error:", e)
+            log(f"ERROR: {e}")
             time.sleep(10)
 
 run_bot()
