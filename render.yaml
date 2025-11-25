@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fxopen-ticktrader-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    region: oregon
+    envVars:
+      FXOPEN_TOKEN_ID: e2ba6e44-f8b9-4157-a1c9-8006c6c5f2d9
+      FXOPEN_TOKEN_KEY: wPC4nZbQQeAsCmPg
+      FXOPEN_TOKEN_SECRET: 9yYkYHsBK4Pr4W3kf6R4ry2aX2w3dp8txZDQfzxxFXKaHB2zDME8Sg4KGYz8mByx
+      SENDER_EMAIL: sayedshadabali8421@gmail.com
+      SENDER_PASSWORD: eynj eiip itff nbga
